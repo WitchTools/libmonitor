@@ -60,7 +60,9 @@
 /*  Sa_flags that monitor requires and forbids.
  */
 #define SAFLAGS_REQUIRED   (SA_SIGINFO | SA_RESTART)
-#define SAFLAGS_FORBIDDEN  (SA_RESETHAND | SA_ONSTACK)
+// SA_ONSTACK is removed to allow Witch tools to have
+// PMU and watchpoint signals on a different stack.
+#define SAFLAGS_FORBIDDEN  (SA_RESETHAND)
 
 typedef int  sigaction_fcn_t(int, const struct sigaction *,
 			     struct sigaction *);
