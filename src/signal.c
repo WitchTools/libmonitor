@@ -1,7 +1,7 @@
 /*
  *  Libmonitor signal functions.
  *
- *  Copyright (c) 2007-2017, Rice University.
+ *  Copyright (c) 2007-2018, Rice University.
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -50,6 +50,8 @@
 #include "common.h"
 #include "monitor.h"
 #include "spinlock.h"
+
+#define MONITOR_CHOOSE_SHOOTDOWN_EARLY  1
 
 /*
  *----------------------------------------------------------------------
@@ -150,6 +152,8 @@ static spinlock_t monitor_signal_lock = SPINLOCK_UNLOCKED;
 
 static int last_resort_signal = SIGWINCH;
 static int shootdown_signal = -1;
+
+static void monitor_choose_shootdown_early(void);
 
 /*
  *----------------------------------------------------------------------
@@ -342,8 +346,7 @@ monitor_signal_init(void)
      */
     k = 0;
 #ifdef SIGRTMIN
-    for (i = 6; i < 14; i++) {
-	sig = SIGRTMIN + i;
+    for (sig = SIGRTMIN + 8; sig <= SIGRTMAX - 8; sig++) {
 	mse = &monitor_signal_array[sig];
 	if (sig < MONITOR_NSIG
 	    && !mse->mse_avoid && !mse->mse_invalid
@@ -369,6 +372,7 @@ monitor_signal_init(void)
 
     /*
      * Allow MONITOR_SHOOTDOWN_SIGNAL to set the shootdown signal.
+     * If set, this always has first priority.
      */
     shootdown_str = getenv("MONITOR_SHOOTDOWN_SIGNAL");
     if (shootdown_str != NULL) {
@@ -385,6 +389,12 @@ monitor_signal_init(void)
 	MONITOR_DEBUG("MONITOR_SHOOTDOWN_SIGNAL = %d\n", shootdown_signal);
     }
 
+#if MONITOR_CHOOSE_SHOOTDOWN_EARLY
+    if (shootdown_signal < 0) {
+	monitor_choose_shootdown_early();
+    }
+#endif
+
     if (monitor_debug) {
 	MONITOR_DEBUG("valid: %d, invalid: %d, avoid: %d, max signum: %d\n",
 		      num_valid, num_invalid, num_avoid, MONITOR_NSIG - 1);
@@ -396,8 +406,15 @@ monitor_signal_init(void)
         monitor_signal_list_string(buf, MONITOR_SIG_BUF_SIZE,
 				   monitor_shootdown_list);
 	MONITOR_DEBUG("shootdown list:%s\n", buf);
+	MONITOR_DEBUG("shootdown signal: %d\n", shootdown_signal);
     }
 }
+
+/*
+ *----------------------------------------------------------------------
+ *  SHOOTDOWN SIGNAL and helper functions
+ *----------------------------------------------------------------------
+ */
 
 /*
  *  Delete from "set" any signals on the keep open list.  Always leave
@@ -412,6 +429,24 @@ monitor_remove_client_signals(sigset_t *set)
     if (set == NULL) {
 	return;
     }
+
+#if MONITOR_CHOOSE_SHOOTDOWN_EARLY
+
+    for (sig = 1; sig < MONITOR_NSIG; sig++) {
+	mse = &monitor_signal_array[sig];
+	if (!mse->mse_avoid && !mse->mse_invalid && mse->mse_keep_open) {
+	    sigdelset(set, sig);
+	}
+    }
+    return;
+
+#else
+    /*
+     * The old, delayed way of choosing the shootdown signal is broken
+     * when using interrupts (deadlocks with sigprocmask).  This could
+     * be fixed with a non-blocking data structure, but the libunwind
+     * use case makes that pointless.
+     */
     MONITOR_SIGNAL_LOCK;
 
     if (shootdown_signal < 0) {
@@ -461,15 +496,36 @@ monitor_remove_client_signals(sigset_t *set)
 	}
     }
     MONITOR_SIGNAL_UNLOCK;
+
+#endif
 }
 
 /*
- *  Adjust sa_flags according to the required and forbidden sets.
+ *  Choose the shootdown signal and add it to the open list.  In the
+ *  early case, pick something on the shootdown list that's not held
+ *  open for the client.
  */
-static inline int
-monitor_adjust_saflags(int flags)
+static void
+monitor_choose_shootdown_early(void)
 {
-    return (flags | SAFLAGS_REQUIRED) & ~(SAFLAGS_FORBIDDEN);
+    int i, sig;
+
+    if (shootdown_signal > 0) {
+	return;
+    }
+
+    for (i = 0; monitor_shootdown_list[i] > 0; i++) {
+	sig = monitor_shootdown_list[i];
+
+	if (! monitor_signal_array[sig].mse_keep_open) {
+	    shootdown_signal = sig;
+	    monitor_signal_array[sig].mse_keep_open = 1;
+	    return;
+	}
+    }
+
+    shootdown_signal = last_resort_signal;
+    monitor_signal_array[last_resort_signal].mse_keep_open = 1;
 }
 
 /*
@@ -478,12 +534,21 @@ monitor_adjust_saflags(int flags)
 int
 monitor_shootdown_signal(void)
 {
-    struct monitor_signal_entry *mse;
-    int i, sig, ans1, ans2, ans3;
-
     if (shootdown_signal > 0) {
 	return shootdown_signal;
     }
+
+#if MONITOR_CHOOSE_SHOOTDOWN_EARLY
+
+    monitor_signal_init();
+    monitor_choose_shootdown_early();
+    return shootdown_signal;
+
+#else
+
+    struct monitor_signal_entry *mse;
+    int i, sig, ans1, ans2, ans3;
+
     MONITOR_SIGNAL_LOCK;
 
     /*
@@ -532,6 +597,8 @@ monitor_shootdown_signal(void)
     MONITOR_SIGNAL_UNLOCK;
 
     return shootdown_signal;
+
+#endif
 }
 
 /*
@@ -539,6 +606,15 @@ monitor_shootdown_signal(void)
  *  SUPPORT FUNCTIONS
  *----------------------------------------------------------------------
  */
+
+/*
+ *  Adjust sa_flags according to the required and forbidden sets.
+ */
+static inline int
+monitor_adjust_saflags(int flags)
+{
+    return (flags | SAFLAGS_REQUIRED) & ~(SAFLAGS_FORBIDDEN);
+}
 
 /*
  *  The client's sigaction.  If "act" is non-NULL, then use it for
