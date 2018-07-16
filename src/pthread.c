@@ -845,6 +845,38 @@ monitor_enable_new_threads(void)
 }
 
 /*
+ *  Copy pthread_create()'s thread info struct into mti.  Note: this
+ *  info is only available inside pthread_create().
+ *
+ *  Returns: 0 on success, or else 1 if error or if called from
+ *  outside pthread_create().
+ */
+int
+monitor_get_new_thread_info(struct monitor_thread_info *mti)
+{
+    struct monitor_thread_node *tn;
+
+    if (mti == NULL) {
+        return 1;
+    }
+
+    tn = monitor_get_tn();
+    if (tn == NULL) {
+	MONITOR_DEBUG1("unable to find thread node\n");
+	return 1;
+    }
+
+    /* Called from outside pthread_create(). */
+    if (tn->tn_thread_info == NULL) {
+        return 1;
+    }
+
+    memcpy(mti, tn->tn_thread_info, sizeof(struct monitor_thread_info));
+
+    return 0;
+}
+
+/*
  *----------------------------------------------------------------------
  *  PTHREAD_CREATE OVERRIDE and HELPER FUNCTIONS
  *----------------------------------------------------------------------
@@ -1010,7 +1042,8 @@ monitor_adjust_stack_size(pthread_attr_t *orig_attr,
 int
 MONITOR_WRAP_NAME(pthread_create)(PTHREAD_CREATE_PARAM_LIST)
 {
-    struct monitor_thread_node *tn;
+    struct monitor_thread_node *tn, *my_tn;
+    struct monitor_thread_info mti;
     pthread_attr_t default_attr;
     int ret, restore, destroy;
     size_t old_size;
@@ -1031,8 +1064,8 @@ MONITOR_WRAP_NAME(pthread_create)(PTHREAD_CREATE_PARAM_LIST)
      * pthread_create(), don't put it on the thread list and don't
      * give any callbacks.
      */
-    tn = monitor_get_tn();
-    if (tn != NULL && tn->tn_ignore_threads) {
+    my_tn = monitor_get_tn();
+    if (my_tn != NULL && my_tn->tn_ignore_threads) {
 	MONITOR_DEBUG1("ignoring this new thread\n");
 	return (*real_pthread_create)(thread, attr, start_routine, arg);
     }
@@ -1049,6 +1082,17 @@ MONITOR_WRAP_NAME(pthread_create)(PTHREAD_CREATE_PARAM_LIST)
 	} else {
 	    MONITOR_DEBUG1("deferring thread support\n");
 	}
+    }
+
+    /*
+     * Create a thread info struct for pthread_create() support
+     * functions.  Note: this info is only available during the
+     * lifetime of the pthread_create() override.
+     */
+    if (my_tn != NULL) {
+        mti.mti_create_return_addr = __builtin_return_address(0);
+        mti.mti_start_routine = (void *) start_routine;
+	my_tn->tn_thread_info = &mti;
     }
 
     /*
@@ -1088,6 +1132,11 @@ MONITOR_WRAP_NAME(pthread_create)(PTHREAD_CREATE_PARAM_LIST)
 		  start_routine);
     monitor_thread_post_create(tn->tn_user_data);
 
+    /* The thread info struct's lifetime ends here. */
+    if (my_tn != NULL) {
+        my_tn->tn_thread_info = NULL;
+    }
+
     return (ret);
 }
 
@@ -1116,34 +1165,23 @@ MONITOR_WRAP_NAME(pthread_exit)(void *data)
 
 /*
  *  Allow the application to modify the thread signal mask, but don't
- *  let it block a signal that the client catches.
+ *  let it change the mask for any signal in the keep open list.
  */
 #ifdef MONITOR_USE_SIGNALS
 int
 MONITOR_WRAP_NAME(pthread_sigmask)(int how, const sigset_t *set,
 				   sigset_t *oldset)
 {
-    char buf[MONITOR_SIG_BUF_SIZE];
-    char *type;
     sigset_t my_set;
 
     monitor_signal_init();
     monitor_thread_name_init();
 
-    type = (how == SIG_UNBLOCK) ? "unblock" : "block";
-    if (monitor_debug) {
-	monitor_sigset_string(buf, MONITOR_SIG_BUF_SIZE, set);
-	MONITOR_DEBUG("(%s) request:%s\n", type, buf);
-    }
-
-    if (set != NULL && (how == SIG_BLOCK || how == SIG_SETMASK)) {
+    if (set != NULL) {
+	MONITOR_DEBUG1("\n");
 	my_set = *set;
-	monitor_remove_client_signals(&my_set);
+	monitor_remove_client_signals(&my_set, how);
 	set = &my_set;
-	if (monitor_debug) {
-	    monitor_sigset_string(buf, MONITOR_SIG_BUF_SIZE, set);
-	    MONITOR_DEBUG("(%s) actual: %s\n", type, buf);
-	}
     }
 
     return (*real_pthread_sigmask)(how, set, oldset);
